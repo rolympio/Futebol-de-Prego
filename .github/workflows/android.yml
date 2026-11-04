@@ -1,0 +1,83 @@
+name: Testes + APK Android
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar Godot ${{ env.GODOT_VERSION }}
+        run: |
+          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip
+          unzip -q Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip
+          mv Godot_v${GODOT_VERSION}-stable_linux.x86_64 godot && chmod +x godot
+
+      - name: Importar projeto
+        run: ./godot --headless --path . --import || ./godot --headless --path . --editor --quit-after 200 || true
+
+      - name: Testes automatizados
+        run: ./godot --headless --path . --fixed-fps 60 --script res://tests/run_tests.gd
+
+      - name: Baixar templates de exportação
+        run: |
+          wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz
+          mkdir -p ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          unzip -q -j Godot_v${GODOT_VERSION}-stable_export_templates.tpz 'templates/android_*' -d ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/
+          echo "${GODOT_VERSION}.stable" > ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/version.txt
+          rm Godot_v${GODOT_VERSION}-stable_export_templates.tpz
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar SDK e chave de teste
+        run: |
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore "$HOME/debug.keystore" -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          mkdir -p ~/.config/godot
+          cat > ~/.config/godot/editor_settings-${GODOT_VERSION}.tres <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_SDK_ROOT}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          sed -i 's/^ *//' ~/.config/godot/editor_settings-${GODOT_VERSION}.tres
+          cat ~/.config/godot/editor_settings-${GODOT_VERSION}.tres
+
+      - name: Exportar APK (debug, para teste)
+        run: |
+          mkdir -p build
+          ./godot --headless --path . --export-debug "Android" build/futebol-de-prego.apk
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: futebol-de-prego-apk
+          path: build/futebol-de-prego.apk
+
+      - name: Publicar na release "apk-mais-recente"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete apk-mais-recente --yes --cleanup-tag || true
+          gh release create apk-mais-recente build/futebol-de-prego.apk \
+            --title "APK de teste (mais recente)" \
+            --notes "APK de teste gerado automaticamente a partir do commit ${GITHUB_SHA::7}. Assinado com chave de depuração: serve para instalar e testar, não para publicar na Play Store." \
+            --prerelease
