@@ -25,6 +25,8 @@ var input_enabled := false
 var aim_team := 0
 var aim_assist := true
 var high_contrast := false
+## true no celular do convidado: o tabuleiro é girado 180° para ele jogar "de baixo"
+var flip := false
 
 var _aiming := false
 var _aim_start := Vector2.ZERO
@@ -235,7 +237,7 @@ func _process(delta: float) -> void:
 			continue
 		p["p"] += p["v"] * delta
 		if p.get("conf", false):
-			p["v"] = p["v"] * 0.96 + Vector2(0, 260) * delta
+			p["v"] = p["v"] * 0.96 + Vector2(0, -260.0 if flip else 260.0) * delta
 			p["rot"] += delta * 8.0
 		else:
 			p["v"] *= 0.9
@@ -330,7 +332,7 @@ func _draw() -> void:
 	for s: float in [-1.0, 1.0]:
 		for px: float in [-gw, gw]:
 			var post := Vector2(px, hh * s)
-			draw_circle(post + Vector2(2, 3), 6.0, Color(0, 0, 0, 0.3))
+			draw_circle(post + _sh(Vector2(2, 3)), 6.0, Color(0, 0, 0, 0.3))
 			draw_circle(post, 6.0, Color.WHITE)
 			draw_circle(post, 3.0, Color("cbd5e1"))
 	# pregos
@@ -374,7 +376,7 @@ func _draw_nail(i: int) -> void:
 	var fl := nail_flash[i]
 	if fl > 0.0:
 		draw_circle(p, r + 10.0 * fl, Color(1, 1, 1, 0.35 * fl))
-	draw_circle(p + Vector2(4, 6), r, Color(0, 0, 0, 0.3))
+	draw_circle(p + _sh(Vector2(4, 6)), r, Color(0, 0, 0, 0.3))
 	draw_circle(p, r + 1.5, col.darkened(0.45))
 	draw_circle(p, r, col)
 	if t == 1:
@@ -382,18 +384,23 @@ func _draw_nail(i: int) -> void:
 		draw_arc(p, r - 2.0, 0, TAU, 24, Color(1, 1, 1, 0.9), 2.0, true)
 	if high_contrast:
 		draw_arc(p, r + 2.5, 0, TAU, 24, Color.WHITE, 2.0, true)
-	draw_circle(p + Vector2(-3.5, -4.0), 3.0, Color(1, 1, 1, 0.55))
+	draw_circle(p + _sh(Vector2(-3.5, -4.0)), 3.0, Color(1, 1, 1, 0.55))
 	var txt := str(nail_numbers[i])
 	var fs := 16
 	var tc := Color("111827") if col.get_luminance() > 0.55 else Color.WHITE
 	var w := FONT.get_string_size(txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs).x
-	draw_string(FONT, p + Vector2(-w * 0.5, 6.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, tc)
+	if flip:
+		draw_set_transform(p, PI)
+		draw_string(FONT, Vector2(-w * 0.5, 6.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, tc)
+		draw_set_transform_matrix(Transform2D.IDENTITY)
+	else:
+		draw_string(FONT, p + Vector2(-w * 0.5, 6.0), txt, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, tc)
 
 
 func _draw_coin(p: Vector2) -> void:
 	var cd: Dictionary = FieldData.COINS[coin_key]
 	var r := CoinSim.COIN_R
-	draw_circle(p + Vector2(4, 7), r, Color(0, 0, 0, 0.35))
+	draw_circle(p + _sh(Vector2(4, 7)), r, Color(0, 0, 0, 0.35))
 	draw_circle(p, r, cd["rim"])
 	draw_circle(p, r - 2.5, cd["face"])
 	draw_arc(p, r - 6.0, 0, TAU, 32, cd["mark"], 1.6, true)
@@ -474,3 +481,7 @@ func _draw_x(p: Vector2) -> void:
 	var c := Color(1, 1, 1, 0.8)
 	draw_line(p + Vector2(-7, -7), p + Vector2(7, 7), c, 3.0, true)
 	draw_line(p + Vector2(7, -7), p + Vector2(-7, 7), c, 3.0, true)
+
+
+func _sh(v: Vector2) -> Vector2:
+	return -v if flip else v

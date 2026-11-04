@@ -67,3 +67,25 @@ Gerado por `godot --headless --path . --fixed-fps 60 --script res://tests/run_te
   OK    desafio 2 desbloqueado
 RESULTADO: 61 ok, 0 falhas
 ```
+
+## Teste de rede (servidor + convidado em 2 processos)
+
+`bash tests/net_test.sh <godot>`
+
+```
+----
+  OK    convidado entra pelo código, cor repetida é trocada, tabuleiro invertido
+  OK    servidor recebe nome do convidado
+  OK    servidor chuta
+  OK    convidado chuta (jogada validada pelo servidor)
+  OK    gol do servidor chega ao convidado
+  OK    servidor detecta queda e aguarda
+  OK    convidado reconecta e recebe o estado
+  OK    partida continua após reconexão
+  OK    placar final igual nos dois (3-0)
+  OK    física igual nos dois aparelhos (diferença máx. 0.1024 px)
+  OK    revanche reinicia no servidor
+  OK    revanche reinicia no convidado
+  OK    saída do adversário é avisada
+RESULTADO REDE: tudo ok
+```

@@ -13,6 +13,8 @@ var settings := {
 	"theme": "campinho",
 	"coin": "real",
 	"tutorial_seen": false,
+	"net_name": "",
+	"net_color": 0,
 }
 var match_cfg := {
 	"difficulty": 1,          # 0 iniciante, 1 intermediário, 2 avançado

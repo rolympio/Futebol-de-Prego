@@ -8,6 +8,7 @@ const SCREENS := {
 	"challenges": preload("res://scripts/ui/challenges_screen.gd"),
 	"settings": preload("res://scripts/ui/settings_screen.gd"),
 	"help": preload("res://scripts/ui/help_screen.gd"),
+	"lan": preload("res://scripts/ui/lan_screen.gd"),
 }
 
 var current: Control

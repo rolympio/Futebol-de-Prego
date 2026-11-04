@@ -29,6 +29,9 @@ jobs:
       - name: Testes automatizados
         run: ./godot --headless --path . --fixed-fps 60 --script res://tests/run_tests.gd
 
+      - name: Teste de rede (servidor + convidado em 2 processos)
+        run: bash tests/net_test.sh ./godot
+
       - name: Baixar templates de exportação
         run: |
           wget -q https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz

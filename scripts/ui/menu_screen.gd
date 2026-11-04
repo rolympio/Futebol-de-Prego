@@ -36,8 +36,15 @@ func _ready() -> void:
 
 	var btns := [
 		UIKit.button("JOGAR CONTRA A CPU", UIKit.GREEN, func() -> void: main.goto("setup", {"mode": "cpu"}), 38, 108),
-		UIKit.button("2 JOGADORES", UIKit.BLUE, func() -> void: main.goto("setup", {"mode": "local"})),
 	]
+	var row0 := HBoxContainer.new()
+	row0.add_theme_constant_override("separation", 16)
+	var b_2p := UIKit.button("2 JOGADORES", UIKit.BLUE, func() -> void: main.goto("setup", {"mode": "local"}))
+	var b_wifi := UIKit.button("NO WI-FI", UIKit.PURPLE, func() -> void: main.goto("lan"))
+	for b in [b_2p, b_wifi]:
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row0.add_child(b)
+	btns.append(row0)
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 16)
 	var b_tr := UIKit.button("TREINO", UIKit.ORANGE, func() -> void: main.goto("match", {"mode": "training"}))

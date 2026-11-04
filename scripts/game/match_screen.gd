@@ -1,8 +1,8 @@
 extends Control
 ## Tela de partida: regras, turnos, IA, HUD, gol, pausa e resultado.
-## Modos: "cpu", "local", "training", "challenge".
+## Modos: "cpu", "local", "training", "challenge", "lan" (Wi-Fi).
 
-enum S { AIM, MOVING, AI, GOAL, OVER }
+enum S { AIM, MOVING, AI, GOAL, OVER, REMOTE }
 
 var main: Control
 var params := {}
@@ -27,6 +27,16 @@ var challenge_idx := 0
 var paused := false
 var _token := 0
 
+# rede (modo "lan")
+var net := false
+var is_host := false
+var my_team := 0
+var _net_wait := false
+var _opponent_quit := false
+var _rematch := [false, false]
+var _time_sync := 0.0
+var _pending_flash := ""
+
 # HUD
 var _hud: Control
 var _top: PanelContainer
@@ -48,7 +58,15 @@ func _ready() -> void:
 	mode = params.get("mode", "cpu")
 	challenge_idx = int(params.get("challenge", 0))
 	cfg = Save.match_cfg.duplicate()
-	if mode == "local" or mode == "cpu":
+	if mode == "lan":
+		net = true
+		is_host = Net.is_host
+		my_team = 0 if is_host else 1
+		cfg = (params.get("net_cfg", {}) as Dictionary).duplicate()
+		for k in Save.match_cfg.keys():
+			if not cfg.has(k):
+				cfg[k] = Save.match_cfg[k]
+	if mode == "local" or mode == "cpu" or mode == "lan":
 		if cfg["rules"] == "rapida":
 			goals_to_win = 3
 			time_limit = 180.0
@@ -79,6 +97,15 @@ func _ready() -> void:
 	board.aim_changed.connect(_on_aim_changed)
 	board.aim_assist = Save.settings["aim_assist"]
 	board.high_contrast = Save.settings["high_contrast"]
+	if net:
+		board.flip = not is_host
+		board.rotation = PI if board.flip else 0.0
+		Net.message.connect(_on_net_msg)
+		Net.peer_left.connect(_on_peer_left)
+		Net.connected_to_host.connect(_on_reconnected)
+		Net.connection_failed.connect(func(r: String) -> void:
+			if _overlay and is_instance_valid(_overlay):
+				_flash_text("SEM CONEXÃO", Color("f87171"), 60, r.left(40)))
 
 	_build_hud()
 	resized.connect(_layout)
@@ -101,7 +128,7 @@ func _start() -> void:
 	extra_used = 0
 	shots_taken = 0
 	turn = 0
-	var cols: Array[Color] = [Save.team_color(0), Save.team_color(1)]
+	var cols: Array[Color] = [_tc(0), _tc(1)]
 	var nails: Dictionary
 	var start := Vector2.ZERO
 	match mode:
@@ -114,12 +141,21 @@ func _start() -> void:
 			nails = FieldData.build_nails(cfg["form0"], cfg["form1"])
 		_:
 			nails = FieldData.build_nails(cfg["form0"], cfg["form1"])
-	board.setup(nails["pts"], nails["teams"], cols, Save.settings["theme"], Save.settings["coin"])
+	board.setup(nails["pts"], nails["teams"], cols, str(cfg.get("theme", Save.settings["theme"])), Save.settings["coin"])
 	board.place_coin(start)
 	_update_hud()
 	Sfx.play("whistle", 0.7)
-	if not Save.settings["tutorial_seen"]:
+	if not Save.settings["tutorial_seen"] and not net:
 		_show_coach()
+	if net and not is_host:
+		# o convidado espera a "foto" do estado enviada pelo servidor
+		var snap: Dictionary = params.get("resume", {})
+		state = S.REMOTE
+		board.input_enabled = false
+		_show_banner()
+		if not snap.is_empty():
+			_apply_turn(snap)
+		return
 	_start_turn()
 
 
@@ -129,6 +165,18 @@ func _start_turn() -> void:
 		return
 	if mode == "cpu" and turn == 1:
 		_ai_turn()
+		return
+	if net:
+		board.aim_team = turn
+		if turn == my_team and not _net_wait:
+			state = S.AIM
+			board.input_enabled = true
+		else:
+			state = S.REMOTE
+			board.input_enabled = false
+		if is_host:
+			_send_turn()
+		_show_banner()
 		return
 	state = S.AIM
 	board.aim_team = turn
@@ -174,6 +222,16 @@ func _ai_turn() -> void:
 func _on_shot_fired(dir: Vector2, power: float) -> void:
 	if state != S.AIM or paused:
 		return
+	if net:
+		if is_host:
+			Net.send("shot", {"dir": dir, "power": power, "pos": board.sim.pos})
+			_launch(dir, power)
+		else:
+			Net.send("req_shot", {"dir": dir, "power": power})
+			state = S.MOVING
+			board.input_enabled = false
+			_hint.text = ""
+		return
 	_launch(dir, power)
 	if _coach:
 		_coach.queue_free()
@@ -203,7 +261,7 @@ func _on_aim_changed(active: bool, power: float) -> void:
 
 
 func _on_coin_stopped() -> void:
-	if state != S.MOVING:
+	if state != S.MOVING or (net and not is_host):
 		return
 	match mode:
 		"training":
@@ -222,7 +280,8 @@ func _on_coin_stopped() -> void:
 			var other := 1 << (1 - turn)
 			if continue_own and (mask & mine) != 0 and (mask & other) == 0 and extra_used < 2:
 				extra_used += 1
-				_flash_text("JOGA DE NOVO!", Save.team_color(turn), 54)
+				_flash_text("JOGA DE NOVO!", _tc(turn), 54)
+				_pending_flash = "JOGA DE NOVO!"
 			else:
 				extra_used = 0
 				turn = 1 - turn
@@ -230,6 +289,8 @@ func _on_coin_stopped() -> void:
 
 
 func _on_goal(team: int) -> void:
+	if net and not is_host:
+		return   # o convidado espera o servidor confirmar o gol
 	state = S.GOAL
 	board.input_enabled = false
 	board.celebrate(team)
@@ -238,22 +299,24 @@ func _on_goal(team: int) -> void:
 	var tok := _token
 	match mode:
 		"training":
-			_flash_text("GOOOL!", Save.team_color(team), 110)
+			_flash_text("GOOOL!", _tc(team), 110)
 			await get_tree().create_timer(1.5, false).timeout
 			if tok != _token or not is_inside_tree():
 				return
 			board.place_coin(Vector2.ZERO)
 			_start_turn()
 		"challenge":
-			_flash_text("GOOOL!" if team == 0 else "GOL CONTRA!", Save.team_color(0) if team == 0 else Color("ef4444"), 110)
+			_flash_text("GOOOL!" if team == 0 else "GOL CONTRA!", _tc(0) if team == 0 else Color("ef4444"), 110)
 			await get_tree().create_timer(1.4, false).timeout
 			if tok != _token or not is_inside_tree():
 				return
 			_finish_challenge(team == 0)
 		_:
 			score[team] += 1
+			if net:
+				Net.send("goal", {"team": team, "score": score})
 			_update_hud()
-			_flash_text("GOOOL!", Save.team_color(team), 120, str(cfg["name%d" % team]).to_upper())
+			_flash_text("GOOOL!", _tc(team), 120, str(cfg["name%d" % team]).to_upper())
 			await get_tree().create_timer(1.8, false).timeout
 			if tok != _token or not is_inside_tree():
 				return
@@ -275,15 +338,28 @@ func _resolve_time_up() -> bool:
 		return true
 	if not golden:
 		golden = true
+		_pending_flash = "GOL DE OURO!"
 		_flash_text("GOL DE OURO!", UIKit.ACCENT, 80, "quem marcar vence")
 		_update_hud()
+		if net and is_host and (state == S.AIM or state == S.REMOTE):
+			_send_turn()
 	return false
 
 
 func _process(delta: float) -> void:
-	if paused or state == S.OVER:
+	if paused or state == S.OVER or _net_wait:
 		return
-	if time_limit > 0.0 and not time_up and (mode == "cpu" or mode == "local"):
+	if net and not is_host:
+		if time_limit > 0.0 and state != S.GOAL and not golden:
+			time_left = maxf(0.0, time_left - delta)
+			_update_timer()
+		return
+	if net and is_host:
+		_time_sync -= delta
+		if _time_sync <= 0.0:
+			_time_sync = 2.0
+			Net.send("time", {"t": time_left})
+	if time_limit > 0.0 and not time_up and (mode == "cpu" or mode == "local" or mode == "lan"):
 		if state != S.GOAL:
 			time_left = maxf(0.0, time_left - delta)
 		if time_left <= 0.0:
@@ -307,6 +383,25 @@ func _finish_match() -> void:
 	Save.stats["goals"] += score[0]
 	var title := ""
 	var col := UIKit.ACCENT
+	if net:
+		if is_host:
+			Net.send("over", {"score": score})
+		if winner == my_team:
+			title = "VITÓRIA!"
+			Sfx.play("goal")
+		elif winner < 0:
+			title = "EMPATE"
+			Sfx.play("whistle")
+		else:
+			title = "DERROTA"
+			col = Color("f87171")
+			Sfx.play("lose")
+		Save.save_all()
+		_show_result(title, col, "%d  x  %d" % [score[0], score[1]], [
+			["REVANCHE", UIKit.GREEN, _request_rematch],
+			["MENU", Color("475569"), _quit_net],
+		])
+		return
 	if mode == "cpu":
 		if winner == 0:
 			title = "VITÓRIA!"
@@ -319,7 +414,7 @@ func _finish_match() -> void:
 			Sfx.play("lose")
 	else:
 		title = ("%s VENCEU!" % str(cfg["name%d" % winner]).to_upper()) if winner >= 0 else "EMPATE"
-		col = Save.team_color(winner) if winner >= 0 else Color.WHITE
+		col = _tc(winner) if winner >= 0 else Color.WHITE
 		Sfx.play("whistle")
 	Save.save_all()
 	_show_result(title, col, "%d  x  %d" % [score[0], score[1]], [
@@ -371,13 +466,16 @@ func _build_hud() -> void:
 	var pause_btn := UIKit.icon_button("II", Color("6366f1"), _toggle_pause, 76)
 	h.add_child(pause_btn)
 
-	if mode == "cpu" or mode == "local":
+	if mode == "cpu" or mode == "local" or mode == "lan":
 		for t in 2:
 			var team := HBoxContainer.new()
 			team.add_theme_constant_override("separation", 8)
 			team.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 			var chip := _chip(t)
-			var nm := UIKit.label(str(cfg["name%d" % t]).to_upper(), 22, Color(1, 1, 1, 0.85), true)
+			var nm_txt := str(cfg["name%d" % t]).to_upper()
+			if net and t == my_team:
+				nm_txt += " (VOCÊ)"
+			var nm := UIKit.label(nm_txt, 22, Color(1, 1, 1, 0.85), true)
 			nm.autowrap_mode = TextServer.AUTOWRAP_OFF
 			nm.clip_text = true
 			nm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -440,7 +538,7 @@ func _chip(t: int) -> Control:
 	var p := Panel.new()
 	p.custom_minimum_size = Vector2(30, 30)
 	p.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	var col := Save.team_color(t)
+	var col := _tc(t)
 	var sb := UIKit.box(col, 15, 0, 4 if t == 1 else 0, Color.WHITE)
 	p.add_theme_stylebox_override("panel", sb)
 	return p
@@ -476,7 +574,7 @@ func _center_banner() -> void:
 
 func _show_banner() -> void:
 	var text := ""
-	var col := Save.team_color(turn)
+	var col := _tc(turn)
 	match mode:
 		"training":
 			text = "TREINO LIVRE"
@@ -486,6 +584,8 @@ func _show_banner() -> void:
 			col = UIKit.PINK
 		"cpu":
 			text = "SUA VEZ  •  ataque para cima" if turn == 0 else "VEZ DA CPU"
+		"lan":
+			text = "SUA VEZ  •  ataque para cima" if turn == my_team else "VEZ DE %s" % str(cfg["name%d" % turn]).to_upper()
 		_:
 			text = "VEZ DO %s  •  ataca para %s" % [str(cfg["name%d" % turn]).to_upper(), "cima" if turn == 0 else "baixo"]
 	if golden:
@@ -510,6 +610,8 @@ func _show_banner() -> void:
 func _set_aim_hint() -> void:
 	if state == S.AI:
 		_hint.text = "A CPU está mirando..."
+	elif state == S.REMOTE:
+		_hint.text = "Aguardando a jogada de %s..." % str(cfg["name%d" % (1 - my_team)])
 	elif state == S.AIM:
 		_hint.text = "Toque, PUXE PARA TRÁS e solte"
 	else:
@@ -529,7 +631,7 @@ func _update_hud() -> void:
 
 
 func _update_timer() -> void:
-	if _center_lbl == null or not (mode == "cpu" or mode == "local"):
+	if _center_lbl == null or not (mode == "cpu" or mode == "local" or mode == "lan"):
 		return
 	if golden:
 		_center_lbl.text = "OURO"
@@ -582,6 +684,9 @@ func _toggle_pause() -> void:
 func _pause() -> void:
 	if paused or state == S.OVER:
 		return
+	if net:
+		_net_menu()
+		return
 	paused = true
 	board.cancel_aim()
 	get_tree().paused = true
@@ -627,11 +732,20 @@ func _rules_summary() -> String:
 
 
 func on_app_paused() -> void:
-	if state != S.OVER:
+	if state != S.OVER and not net:
 		_pause()
 
 
 func on_back() -> void:
+	if net:
+		if state == S.OVER:
+			_quit_net()
+		elif _overlay and is_instance_valid(_overlay) and not _net_wait:
+			_overlay.queue_free()
+			_overlay = null
+		else:
+			_net_menu()
+		return
 	if state == S.OVER:
 		main.goto("menu")
 	elif paused:
@@ -674,7 +788,7 @@ func _show_result(title: String, col: Color, big: String, buttons: Array, stars 
 	await get_tree().create_timer(0.4).timeout
 	if not is_inside_tree():
 		return
-	var o := _panel_overlay(title, buttons, _rules_summary() if mode in ["cpu", "local"] else "", big)
+	var o := _panel_overlay(title, buttons, _rules_summary() if mode in ["cpu", "local", "lan"] else "", big)
 	var lbl := o.get_child(0).get_child(0).get_child(0).get_child(0) as Label
 	if lbl:
 		lbl.add_theme_color_override("font_color", col if col.get_luminance() > 0.5 else col.lightened(0.45))
@@ -693,3 +807,218 @@ func _show_coach() -> void:
 	_coach.set("board", board)
 	_coach.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_hud.add_child(_coach)
+
+
+func _tc(t: int) -> Color:
+	return FieldData.TEAM_COLORS[clampi(int(cfg["color%d" % clampi(t, 0, 1)]), 0, FieldData.TEAM_COLORS.size() - 1)]["c"]
+
+
+# ------------------------------------------------------------------ rede (Wi-Fi)
+func _snapshot() -> Dictionary:
+	return {"pos": board.sim.pos, "turn": turn, "score": score.duplicate(), "time_left": time_left,
+		"golden": golden, "over": state == S.OVER}
+
+
+func _send_turn() -> void:
+	var snap := _snapshot()
+	snap["flash"] = _pending_flash
+	_pending_flash = ""
+	Net.send("turn", snap)
+
+
+## Convidado: aplica a "foto" do estado enviada pelo servidor.
+func _apply_turn(d: Dictionary) -> void:
+	var pos = d.get("pos", Vector2.ZERO)
+	if typeof(pos) == TYPE_VECTOR2:
+		board.place_coin(pos)
+	var sc = d.get("score", [0, 0])
+	if typeof(sc) == TYPE_ARRAY and sc.size() == 2:
+		score = [int(sc[0]), int(sc[1])]
+	turn = clampi(int(d.get("turn", 0)), 0, 1)
+	time_left = float(d.get("time_left", time_left))
+	var g := bool(d.get("golden", false))
+	if g and not golden:
+		_flash_text("GOL DE OURO!", UIKit.ACCENT, 80, "quem marcar vence")
+	golden = g
+	var fl := str(d.get("flash", ""))
+	if fl == "JOGA DE NOVO!":
+		_flash_text(fl, _tc(turn), 54)
+	if state == S.OVER:
+		return
+	board.aim_team = turn
+	if turn == my_team:
+		state = S.AIM
+		board.input_enabled = true
+	else:
+		state = S.REMOTE
+		board.input_enabled = false
+	_update_hud()
+	_show_banner()
+
+
+func _on_net_msg(type: String, d: Dictionary) -> void:
+	match type:
+		"hello":
+			# reconexão do convidado durante a partida
+			if not is_host:
+				return
+			if int(d.get("proto", -1)) != Net.PROTOCOL:
+				Net.send("reject", {"reason": "Versões diferentes do jogo."})
+				return
+			_net_wait = false
+			_close_overlay_if_wait()
+			Net.send("start", {"cfg": cfg, "resume": _snapshot()})
+			_flash_text("VOLTOU!", UIKit.GREEN, 70)
+			if state == S.AIM or state == S.REMOTE:
+				_start_turn()
+		"start":
+			if is_host:
+				return
+			var c: Dictionary = d.get("cfg", {})
+			if not c.is_empty():
+				main.goto("match", {"mode": "lan", "net_cfg": c, "resume": d.get("resume", {})})
+		"req_shot":
+			if not is_host or state != S.REMOTE or turn == my_team or _net_wait:
+				return
+			var dir = d.get("dir")
+			var pw = d.get("power")
+			if typeof(dir) != TYPE_VECTOR2 or not (typeof(pw) == TYPE_FLOAT or typeof(pw) == TYPE_INT):
+				return
+			if not dir.is_finite() or dir.length() < 0.5 or not is_finite(float(pw)):
+				return
+			var p := clampf(float(pw), 0.0, 1.0)
+			Net.send("shot", {"dir": dir.normalized(), "power": p, "pos": board.sim.pos})
+			_launch(dir.normalized(), p)
+		"shot":
+			if is_host:
+				return
+			var dir = d.get("dir")
+			var pos = d.get("pos")
+			if typeof(dir) != TYPE_VECTOR2 or typeof(pos) != TYPE_VECTOR2:
+				return
+			board.place_coin(pos)
+			board.aim_team = turn
+			_launch(dir, clampf(float(d.get("power", 0.5)), 0.0, 1.0))
+		"turn":
+			if not is_host:
+				_apply_turn(d)
+		"goal":
+			if is_host:
+				return
+			var team := clampi(int(d.get("team", 0)), 0, 1)
+			var sc = d.get("score", score)
+			if typeof(sc) == TYPE_ARRAY and sc.size() == 2:
+				score = [int(sc[0]), int(sc[1])]
+			state = S.GOAL
+			board.input_enabled = false
+			board.place_coin(board.sim.pos)
+			board.celebrate(team)
+			Sfx.play("goal", 1.0)
+			Save.vibrate(140)
+			_update_hud()
+			_flash_text("GOOOL!", _tc(team), 120, str(cfg["name%d" % team]).to_upper())
+		"time":
+			if not is_host:
+				time_left = float(d.get("t", time_left))
+		"over":
+			if is_host or state == S.OVER:
+				return
+			var sc = d.get("score", score)
+			if typeof(sc) == TYPE_ARRAY and sc.size() == 2:
+				score = [int(sc[0]), int(sc[1])]
+			_update_hud()
+			_finish_match()
+		"rematch":
+			_rematch[1 - my_team] = true
+			if not _rematch[my_team]:
+				_flash_text("REVANCHE?", UIKit.GREEN, 70, "o adversário quer jogar de novo")
+			_check_rematch()
+		"bye":
+			_opponent_quit = true
+			_show_opponent_left("%s saiu da partida." % str(cfg["name%d" % (1 - my_team)]))
+
+
+func _request_rematch() -> void:
+	if _opponent_quit:
+		return
+	_rematch[my_team] = true
+	Net.send("rematch")
+	_flash_text("AGUARDANDO...", Color.WHITE, 54, "esperando o adversário aceitar")
+	_check_rematch()
+
+
+func _check_rematch() -> void:
+	if is_host and _rematch[0] and _rematch[1]:
+		Net.send("start", {"cfg": cfg})
+		main.goto("match", {"mode": "lan", "net_cfg": cfg})
+
+
+func _quit_net() -> void:
+	_opponent_quit = true
+	Net.send("bye")
+	await get_tree().process_frame
+	Net.leave()
+	main.goto("menu")
+
+
+func _net_menu() -> void:
+	if _overlay and is_instance_valid(_overlay):
+		return
+	_overlay = _panel_overlay("MENU", [
+		["CONTINUAR", UIKit.GREEN, func() -> void:
+			if _overlay:
+				_overlay.queue_free()
+				_overlay = null],
+		["SAIR DA PARTIDA", Color("ef4444"), func() -> void:
+			UIKit.confirm(_overlay, "Sair da partida no Wi-Fi? Ela termina para os dois.", "SAIR", _quit_net)],
+	], "Partida no Wi-Fi não pausa: o jogo continua para o adversário.\n" + _rules_summary())
+
+
+func _close_overlay_if_wait() -> void:
+	if _overlay and is_instance_valid(_overlay) and _overlay.has_meta("wait"):
+		_overlay.queue_free()
+		_overlay = null
+
+
+func _on_peer_left() -> void:
+	if _opponent_quit or not is_inside_tree():
+		return
+	if state == S.OVER:
+		_opponent_quit = true
+		_flash_text("ADVERSÁRIO SAIU", Color("f87171"), 60)
+		return
+	_net_wait = true
+	board.input_enabled = false
+	board.cancel_aim()
+	if _overlay and is_instance_valid(_overlay):
+		_overlay.queue_free()
+	if is_host:
+		Net.open_room()
+		_overlay = _panel_overlay("CONEXÃO CAIU", [
+			["ENCERRAR PARTIDA", Color("ef4444"), _quit_net],
+		], "Aguardando %s voltar...\nEle deve entrar de novo com o código %s." % [str(cfg["name1"]), Net.code_from_ip(Net.host_ip)])
+	else:
+		_overlay = _panel_overlay("CONEXÃO CAIU", [
+			["RECONECTAR", UIKit.GREEN, func() -> void:
+				_flash_text("RECONECTANDO...", Color.WHITE, 50)
+				Net.join_room(Net.host_ip)],
+			["ENCERRAR", Color("ef4444"), _quit_net],
+		], "Verifique se você ainda está no mesmo Wi-Fi.")
+	_overlay.set_meta("wait", true)
+
+
+func _on_reconnected() -> void:
+	Net.send("hello", {"proto": Net.PROTOCOL, "name": str(cfg["name1"]), "color": int(cfg["color1"]), "resume": true})
+
+
+func _show_opponent_left(msg: String) -> void:
+	_net_wait = true
+	board.input_enabled = false
+	if _overlay and is_instance_valid(_overlay):
+		_overlay.queue_free()
+	_overlay = _panel_overlay("FIM DE JOGO", [
+		["MENU", Color("475569"), func() -> void:
+			Net.leave()
+			main.goto("menu")],
+	], msg)
+	state = S.OVER
